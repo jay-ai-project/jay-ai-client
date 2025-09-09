@@ -1,31 +1,15 @@
+import asyncio
+
 import chainlit as cl
-from chainlit.config import (
-    ChainlitConfigOverrides,
-    SpontaneousFileUploadFeature,
-    McpFeature,
-    UISettings,
-    FeaturesSettings
-)
 from chainlit.mcp import McpConnection
+from chainlit.data import get_data_layer
+from chainlit.types import ThreadDict
+from chainlit.input_widget import Select, Switch, Slider, TextInput
+from chainlit.element import Element
 from mcp import ClientSession
 
-from chainlit.data import get_data_layer
-from chainlit.data.chainlit_data_layer import ChainlitDataLayer
-from chainlit.types import ThreadDict
-from chainlit.user_session import UserSession
-from chainlit.session import WebsocketSession
-from chainlit.context import ChainlitContext
-from chainlit.input_widget import Select, Switch, Slider, InputWidget
-from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import SystemMessage
-from langchain.schema.runnable.config import RunnableConfig
-from contextlib import nullcontext
-from langchain_core.runnables import RunnableSerializable
-from langchain_core.messages import AIMessageChunk
-import httpx
-
-import config
+from chat import async_run_stream_messages, list_ollama_models
+import utils
 
 
 ########################################################################################################################
@@ -35,8 +19,6 @@ import config
 async def auth_callback(username: str, password: str):
     if (username, password) == ("admin", "admin"):
         return cl.User(identifier="admin", metadata={"role": "admin", "provider": "credentials"})
-    if (username, password) == ("jay", "jay"):
-        return cl.User(identifier="jay", metadata={"role": "user", "provider": "credentials"})
     return None
 
 
@@ -68,18 +50,16 @@ starters = [
 ]
 
 commands = [
-    {"id": "Picture", "icon": "image", "description": "Use DALL-E"},
-    {"id": "Search", "icon": "globe", "description": "Find on the web"},
-    {"id": "JiraTicket", "icon": "pen-line", "description": "Make a Jira ticket"},
+    {"id": "Clear Chat History", "icon": "pencil-off", "description": "Delete past chat history"},
+    # {"id": "Picture", "icon": "image", "description": "Use ComfyUI"},
+    # {"id": "Search", "icon": "globe", "description": "Find on the web"},
+    # {"id": "JiraTicket", "icon": "pen-line", "description": "Make a Jira ticket"},
 ]
 
 
 @cl.cache
-def list_ollama_models() -> list[dict]:
-    url = f"{config.OLLAMA_BASE_URL}/api/tags"
-    response = httpx.get(url)
-    response.raise_for_status()
-    return response.json()["models"]
+def cached_list_ollama_models() -> list[dict]:
+    return list_ollama_models()
 
 
 async def _initialize():
@@ -88,7 +68,7 @@ async def _initialize():
         Select(
             id="model",
             label="Model",
-            items={model["name"]: model["name"] for model in list_ollama_models()},
+            items={model["name"]: model["name"] for model in cached_list_ollama_models()},
             initial_value=cl.context.session.chat_settings.get("model", models[0]["name"])
         ),
         Slider(
@@ -108,6 +88,12 @@ async def _initialize():
             id="tooling",
             label="Tool Use",
             initial=cl.context.session.chat_settings.get("tooling", False)
+        ),
+        TextInput(
+            id="system_prompt",
+            label="System Prompt",
+            initial=cl.context.session.chat_settings.get("system_prompt"),
+            multiline=True
         )
     ]).send()
     await cl.context.emitter.set_commands(commands)
@@ -185,11 +171,16 @@ async def call_mcp_tool(tool_call):
 ########################################################################################################################
 # Handle messages
 ########################################################################################################################
+@cl.cache
+def cached_read_base64_from_url(url: str) -> str:
+    return utils.read_base64_from_url(url)
+
+
 async def get_chat_history(limit: int | None = None, exclude_id: str | None = None):
     params = {"thread_id": cl.context.session.thread_id}
     query = """
         SELECT 
-            type, output, "isError" 
+            id, type, output, "isError" 
         FROM "Step" 
         WHERE "threadId" = $1
         AND type IN ('user_message', 'assistant_message')
@@ -200,101 +191,182 @@ async def get_chat_history(limit: int | None = None, exclude_id: str | None = No
     query += ' ORDER BY "startTime" DESC'
     if limit:
         query += f" LIMIT {limit}"
+    
     data_layer = get_data_layer()
-    result = reversed(await data_layer.execute_query(query, params))
+    steps = reversed(await data_layer.execute_query(query, params))
+    elements = await data_layer.execute_query(f"""
+        SELECT 
+            e."stepId", e.mime, e."objectKey"
+        FROM "Element" e JOIN ({query}) s
+        ON e."stepId" = s.id
+    """, params)
+
+    async def _async_mapper(element):
+        url = await data_layer.storage_client.get_read_url(element["objectKey"])
+        url = url.split("?")[0] # for local caching
+        base64data = cached_read_base64_from_url(url)
+        type = Element.infer_type_from_mime(element["mime"])
+        return element["stepId"], {"type": type, "mime_type": element["mime"], "source_type": "base64", "data": base64data}
+
+    elements = await asyncio.gather(*list(map(_async_mapper, elements)))
+    elements_for_step: dict[str, list] = {}
+    for step_id, element in elements:
+        if step_id not in elements_for_step:
+            elements_for_step[step_id] = []
+        elements_for_step[step_id].append(element)
     
     # TODO: Tool Message에 대한 처리, metadata의 tool_calls, tool message 등 처리
-    # TODO: elements 데이터 처리, cache 활용
-    def _mapper(message):
-        if message["type"] == "user_message":
-            return {"type": "human", "content": message["output"]}
-        if message["type"] == "assistant_message":
-            return {"type": "ai", "content": message["output"]}
+    def _mapper(step):
+        content = []
+        if step["output"]:
+            content.append({"type": "text", "text": step["output"]})
+        if elements := elements_for_step.get(step["id"]):
+            content.extend(elements)
+        if step["type"] == "user_message":
+            return {"type": "human", "content": content}
+        if step["type"] == "assistant_message":
+            return {"type": "ai", "content": content}
     
-    return list(map(_mapper, result))
+    result = list(map(_mapper, steps))
+    return result
+
+
+async def clear_chat_history():
+    data_layer = get_data_layer()
+    thread = await data_layer.get_thread(cl.context.session.thread_id)
+    for element in thread["elements"]:
+        await data_layer.delete_element(element["id"], thread["id"])
+    for step in thread["steps"]:
+        await data_layer.delete_step(step["id"])
+
+
+async def get_content_with_elements(message: cl.Message) -> list[dict]:
+    content = []
+    if message.content:
+        content.append({
+            "type": "text",
+            "text": message.content
+        })
+    for element in message.elements:
+        content.append({
+            "type": element.type,
+            "mime_type": element.mime,
+            "source_type": "base64",
+            "data": utils.read_base64_from_file_path(element.path)
+        })
+    return content
 
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    # TODO: message.command 로 특정 작업 지시 추가
+    if message.command == "Clear Chat History":
+        message.type = "system_message"
+        message.content = "chat history deleted."
+        await clear_chat_history()
+        await message.update()
+        return
     
-    # Resume 후 첫 메시지 입력 시 history에 현재 메시지도 포함되어 exclude 처리 필요함
-    # TODO: Context 크기에 따른 limit 조정, 매뉴얼 설정, 이전 대화 기록 삭제 등 처리 등
-    # TODO: input element 데이터 처리
     chat_history = await get_chat_history(exclude_id=message.id, limit=100)
-    print(message.elements)
-    chat_history.append({
-        "type": "human",
-        "content": message.content
-    })
 
-    llm = ChatOllama(
-        base_url=config.OLLAMA_BASE_URL,
-        model=cl.context.session.chat_settings.get("model"),
-        num_ctx=cl.context.session.chat_settings.get("num_ctx"),
-        reasoning=cl.context.session.chat_settings.get("reasoning"),
-    )
+    messages = [{
+        "type": "human",
+        "content": await get_content_with_elements(message)
+    }]
+
+    additional_options={
+        "ollama": dict(
+            model=cl.context.session.chat_settings.get("model"),
+            num_ctx=cl.context.session.chat_settings.get("num_ctx"),
+            reasoning=cl.context.session.chat_settings.get("reasoning"),
+            tooling=cl.context.session.chat_settings.get("tooling")
+        ),
+        "system_prompt": cl.context.session.chat_settings.get("system_prompt"),
+    }
 
     if cl.context.session.chat_settings.get("tooling"):
-        mcp_tools: dict = cl.user_session.get("mcp_tools", {})
-        for tools in mcp_tools.values():
-            llm = llm.bind_tools(tools=tools)
+        additional_options["mcp_tools"] = []
+        for tools in cl.user_session.get("mcp_tools", {}).values():
+            additional_options["mcp_tools"].extend(tools)
 
-    prompt_template = ChatPromptTemplate.from_messages(
-        [
-            # SystemMessage(SYSTEM_PROMPT),
-            MessagesPlaceholder(variable_name="messages")
-        ]
-    )
-    runnable = prompt_template | llm
+
+    with cl.Step(type="llm", name=cl.context.session.chat_settings.get("model"), default_open=True) as graph_step:
+        output = cl.Message(content="")
+
+        stream = async_run_stream_messages(
+            thread_id=message.id,
+            input={"chat_history": chat_history, "messages": messages},
+            additional_options=additional_options
+        )
+
+        reasoning_step: cl.Step = None
+        content_step: cl.Step = None
+        tool_call_steps: dict[str, cl.Step] = {}
+
+        while True:    
+            async for sse in stream:
+                if sse.event == "message":
+                    chunk: dict = sse.json()["chunk"]
+
+                    if reasoning_content := chunk["additional_kwargs"].get("reasoning_content"):
+                        if not reasoning_step:
+                            reasoning_step = cl.Step(name="Reasoning", type="llm")
+                        with reasoning_step:
+                            await reasoning_step.stream_token(reasoning_content)
+                        continue
+                    
+                    if reasoning_step:
+                        await reasoning_step.send()
+                        reasoning_step = None
+                    
+                    if (content := chunk.get("content")) and not chunk.get("tool_call_id"):
+                        if not content_step:
+                            content_step = cl.Step(name="Content", type="llm")
+                        with content_step:
+                            await content_step.stream_token(content)
+                        continue
+
+                    if content_step:
+                        output.content = content_step.output
+                        await content_step.send()
+                        content_step = None
+
+                    if response_metadata := chunk.get("response_metadata"):
+                        _step = cl.Step(type="llm", name="Response Metadata")
+                        with _step:
+                            _step.output = response_metadata
+                            await _step.send()
+                    
+                    if tool_calls := chunk.get("tool_calls"):
+                        for tool_call in tool_calls:
+                            tool_call_step = cl.Step(name=f"Tool: {tool_call["name"]}", type="tool", language="json", show_input=True)
+                            with tool_call_step:
+                                tool_call_step.input = tool_call["args"]
+                                await tool_call_step.stream_token("")
+                            tool_call_steps[tool_call["id"]] = tool_call_step
+
+                    if tool_call_id := chunk.get("tool_call_id"):
+                        with tool_call_steps[tool_call_id]:
+                            tool_call_steps[tool_call_id].is_error = (chunk["status"] != "success")
+                            tool_call_steps[tool_call_id].output = chunk["content"]
+                            await tool_call_steps[tool_call_id].send()
+                else:
+                    break
+
+            if sse.event == "interrupts":
+                # TODO: Make this parallel
+                tool_results = [await call_mcp_tool(tool_call) for tool_call in sse.json()]
+                stream = async_run_stream_messages(
+                    thread_id=message.id,
+                    input={},
+                    resume=tool_results,
+                    additional_options=additional_options
+                )
+
+            elif sse.event == "error":
+                # TODO: handle error
+                raise sse.json()
+            
+            else:
+                break
     
-    while True:
-        ai_message = await chat_stream(runnable, chat_history)
-        chat_history.append(ai_message)
-        if not ai_message["tool_calls"]:
-            break
-        for tool_call in ai_message["tool_calls"]:
-            tool_result = await call_mcp_tool(tool_call)
-            # TODO: tool_result.isError handling
-            chat_history.append({
-                "type": "tool",
-                "content": tool_result,
-                "tool_call_id": tool_call["id"]
-            })
-
-
-async def chat_stream(runnable: RunnableSerializable[dict, AIMessageChunk], messages: list[dict]):
-    output = cl.Message(content="")
-
-    if cl.context.session.chat_settings.get("reasoning"):
-        reasoning_step = cl.Step("Reasoning", type="llm", default_open=True)
-    else:
-        reasoning_step = nullcontext()
-
-    tool_calls = []
-    response_metadata = {}
-
-    async with reasoning_step:
-        async for chunk in runnable.astream({"messages": messages}):
-            if reasoning_chunk := chunk.additional_kwargs.get("reasoning_content"):
-                await reasoning_step.stream_token(reasoning_chunk)
-            if content_chunk := chunk.content:
-                await output.stream_token(content_chunk)
-            if chunk.tool_calls:
-                tool_calls = chunk.tool_calls
-            if chunk.response_metadata:
-                response_metadata = chunk.response_metadata
-
-    if isinstance(reasoning_step, cl.Step) and not reasoning_step.output:
-        await reasoning_step.remove()
-    if content := output.content:
-        await output.send()
-    else:
-        await output.remove()
-    
-    return {
-        "type": "ai",
-        "content": content,
-        "tool_calls": tool_calls,
-        "response_metadata": response_metadata
-    }
+    await output.send()

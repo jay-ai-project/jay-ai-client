@@ -1,5 +1,6 @@
 from starlette.config import Config
 
+
 env = Config()
 
 

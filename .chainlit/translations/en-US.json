@@ -65,7 +65,7 @@
             }
         },
         "commands": {
-            "button": "Tools",
+            "button": "/cmd",
             "changeTool": "Change Tool",
             "availableTools": "Available Tools"
         },
@@ -86,7 +86,7 @@
         "messages": {
             "status": {
                 "using": "Using",
-                "used": "Used"
+                "used": ""
             },
             "actions": {
                 "copy": {

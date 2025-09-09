@@ -8,7 +8,4 @@ dependencies = [
     "asyncpg>=0.30.0",
     "boto3>=1.40.25",
     "chainlit>=2.7.2",
-    "langchain>=0.3.27",
-    "langchain-ollama>=0.3.7",
-    "langgraph>=0.6.6",
 ]
