@@ -336,6 +336,7 @@ async def on_message(message: cl.Message):
                             _step.output = response_metadata
                             await _step.send()
                     
+                    # TODO: exclude mcp tool calls
                     if tool_calls := chunk.get("tool_calls"):
                         for tool_call in tool_calls:
                             tool_call_step = cl.Step(name=f"Tool: {tool_call["name"]}", type="tool", language="json", show_input=True)
