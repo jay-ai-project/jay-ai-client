@@ -1,3 +1,4 @@
+from typing import Any
 import asyncio
 
 import chainlit as cl
@@ -135,7 +136,7 @@ async def on_mcp_connect(connection: McpConnection, session: ClientSession):
     
     # Process tool metadata
     tools = [{
-        "name": t.name,
+        "name": f"mcp.{connection.name}.{t.name}",
         "description": t.description,
         "input_schema": t.inputSchema,
     } for t in result.tools]
@@ -155,16 +156,12 @@ async def on_mcp_disconnect(name: str, session: ClientSession):
 
 
 @cl.step(type="tool") 
-async def call_mcp_tool(tool_call):
-    mcp_tools = cl.user_session.get("mcp_tools", {})
-    mcp_name = None
-    for k in mcp_tools:
-        for mcp_tool in mcp_tools[k]:
-            if mcp_tool["name"] == tool_call["name"]:
-                mcp_name = k
-                break
+async def call_mcp_tool(tool_call: dict[str, str | Any]):
+    splits = tool_call["name"].split(".")
+    mcp_name = splits[1]
+    tool_name = ".".join(splits[2:])
     mcp_session, _ = cl.context.session.mcp_sessions.get(mcp_name)
-    result = await mcp_session.call_tool(tool_call["name"], tool_call["args"])
+    result = await mcp_session.call_tool(tool_name, tool_call["args"])
     return [content.model_dump() for content in result.content]
 
 
@@ -336,9 +333,11 @@ async def on_message(message: cl.Message):
                             _step.output = response_metadata
                             await _step.send()
                     
-                    # TODO: exclude mcp tool calls
                     if tool_calls := chunk.get("tool_calls"):
                         for tool_call in tool_calls:
+                            # exclude mcp tool calls
+                            if tool_call["name"].startswith("mcp."):
+                                continue
                             tool_call_step = cl.Step(name=f"Tool: {tool_call["name"]}", type="tool", language="json", show_input=True)
                             with tool_call_step:
                                 tool_call_step.input = tool_call["args"]
