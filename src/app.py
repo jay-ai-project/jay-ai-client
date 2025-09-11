@@ -1,3 +1,4 @@
+import textwrap
 from typing import Any
 import asyncio
 
@@ -57,6 +58,32 @@ commands = [
     # {"id": "JiraTicket", "icon": "pen-line", "description": "Make a Jira ticket"},
 ]
 
+agents = {
+    "Ollama Agent": {
+        "graph_name": "Ollama_Agent",
+        "chat_profile": {
+            "markdown_description": "Basic ReAct Agent",
+            "starters": starters,
+            "default": True
+        },
+    },
+    "Test Code Writer": {
+        "graph_name": "Test_Code_Writer",
+        "chat_profile": {
+            "markdown_description": textwrap.dedent("""
+                ### 테스트 코드 자동 생성
+
+                소스 코드를 분석하여 단위 테스트 코드를 자동으로 생성하는 AI 에이전트입니다. 테스트 계획을 수립하고, 계획에 따라 코드를 작성한 후, 최종 작업 내용을 보고합니다. 반복적인 테스트 코드 작성 업무를 자동화하여 개발 생산성을 높일 수 있습니다.
+            """),
+        },
+    }
+}
+
+
+@cl.set_chat_profiles
+async def set_chat_profiles():
+    return [cl.ChatProfile(name, **agent["chat_profile"]) for name, agent in agents.items()]
+
 
 @cl.cache
 def cached_list_ollama_models() -> list[dict]:
@@ -64,56 +91,58 @@ def cached_list_ollama_models() -> list[dict]:
 
 
 async def _initialize():
-    models = list_ollama_models()
-    await cl.ChatSettings([
-        Select(
-            id="model",
-            label="Model",
-            items={model["name"]: model["name"] for model in cached_list_ollama_models()},
-            initial_value=cl.context.session.chat_settings.get("model", models[0]["name"])
-        ),
-        Slider(
-            id="num_ctx",
-            label="Context Window",
-            min=4*1024,
-            max=128*1024,
-            step=4*1024,
-            initial=cl.context.session.chat_settings.get("num_ctx", 16*1024)
-        ),
-        Switch(
-            id="reasoning",
-            label="Reasoning",
-            initial=cl.context.session.chat_settings.get("reasoning", False)
-        ),
-        Switch(
-            id="tooling",
-            label="Tool Use",
-            initial=cl.context.session.chat_settings.get("tooling", False)
-        ),
-        TextInput(
-            id="system_prompt",
-            label="System Prompt",
-            initial=cl.context.session.chat_settings.get("system_prompt"),
-            multiline=True
-        )
-    ]).send()
+    if cl.context.session.chat_profile == "Ollama Agent":
+        models = cached_list_ollama_models()
+        await cl.ChatSettings([
+            Select(
+                id="model",
+                label="Model",
+                items={model["name"]: model["name"] for model in models},
+                initial_value=cl.context.session.chat_settings.get("model", models[0]["name"])
+            ),
+            Slider(
+                id="num_ctx",
+                label="Context Window",
+                min=4*1024,
+                max=128*1024,
+                step=4*1024,
+                initial=cl.context.session.chat_settings.get("num_ctx", 16*1024)
+            ),
+            Switch(
+                id="reasoning",
+                label="Reasoning",
+                initial=cl.context.session.chat_settings.get("reasoning", False)
+            ),
+            Switch(
+                id="tooling",
+                label="Tool Use",
+                initial=cl.context.session.chat_settings.get("tooling", False)
+            ),
+            TextInput(
+                id="system_prompt",
+                label="System Prompt",
+                initial=cl.context.session.chat_settings.get("system_prompt"),
+                multiline=True
+            )
+        ]).send()
+    elif cl.context.session.chat_profile == "Test Code Writer":
+        await cl.ChatSettings([
+            Slider(
+                id="num_ctx",
+                label="Context Window",
+                min=4*1024,
+                max=128*1024,
+                step=4*1024,
+                initial=cl.context.session.chat_settings.get("num_ctx", 32*1024)
+            ),
+            Switch(
+                id="reasoning",
+                label="Reasoning",
+                initial=cl.context.session.chat_settings.get("reasoning", False)
+            )
+        ]).send()
+    
     await cl.context.emitter.set_commands(commands)
-
-
-@cl.set_chat_profiles
-async def set_chat_profiles():
-    return [
-        cl.ChatProfile(
-            name="Jay AI Chat",
-            markdown_description="Basic ReAct Agent",
-            starters=starters,
-            default=True
-        ),
-        cl.ChatProfile(
-            name="Custom Agent",
-            markdown_description="Custom Agent",
-        )
-    ]
 
 
 @cl.on_chat_start
@@ -136,7 +165,7 @@ async def on_mcp_connect(connection: McpConnection, session: ClientSession):
     
     # Process tool metadata
     tools = [{
-        "name": f"mcp.{connection.name}.{t.name}",
+        "name": f"mcp__{connection.name}__{t.name}",
         "description": t.description,
         "input_schema": t.inputSchema,
     } for t in result.tools]
@@ -155,11 +184,10 @@ async def on_mcp_disconnect(name: str, session: ClientSession):
     cl.user_session.set("mcp_tools", mcp_tools)
 
 
-@cl.step(type="tool") 
 async def call_mcp_tool(tool_call: dict[str, str | Any]):
-    splits = tool_call["name"].split(".")
+    splits = tool_call["name"].split("__")
     mcp_name = splits[1]
-    tool_name = ".".join(splits[2:])
+    tool_name = "__".join(splits[2:])
     mcp_session, _ = cl.context.session.mcp_sessions.get(mcp_name)
     result = await mcp_session.call_tool(tool_name, tool_call["args"])
     return [content.model_dump() for content in result.content]
@@ -279,27 +307,27 @@ async def on_message(message: cl.Message):
         ),
         "system_prompt": cl.context.session.chat_settings.get("system_prompt"),
     }
+    
+    additional_options["mcp_tools"] = []
+    for tools in cl.user_session.get("mcp_tools", {}).values():
+        additional_options["mcp_tools"].extend(tools)
 
-    if cl.context.session.chat_settings.get("tooling"):
-        additional_options["mcp_tools"] = []
-        for tools in cl.user_session.get("mcp_tools", {}).values():
-            additional_options["mcp_tools"].extend(tools)
-
-
-    with cl.Step(type="llm", name=cl.context.session.chat_settings.get("model"), default_open=True) as graph_step:
+    graph_step_name = cl.context.session.chat_settings.get("model") or "Graph"
+    with cl.Step(type="llm", name=graph_step_name, default_open=True):
         output = cl.Message(content="")
 
         stream = async_run_stream_messages(
+            graph_name=agents[cl.context.session.chat_profile]["graph_name"],
             thread_id=message.id,
             input={"chat_history": chat_history, "messages": messages},
             additional_options=additional_options
         )
 
-        reasoning_step: cl.Step = None
-        content_step: cl.Step = None
-        tool_call_steps: dict[str, cl.Step] = {}
-
         while True:    
+            reasoning_step: cl.Step = None
+            content_step: cl.Step = None
+            interrupts: list[dict] = []
+
             async for sse in stream:
                 if sse.event == "message":
                     chunk: dict = sse.json()["chunk"]
@@ -326,46 +354,62 @@ async def on_message(message: cl.Message):
                         output.content = content_step.output
                         await content_step.send()
                         content_step = None
+                
+                elif sse.event == "interrupts":
+                    interrupts = sse.json()
+                elif sse.event == "error":
+                    # TODO: handle error
+                    raise sse.json()
 
-                    if response_metadata := chunk.get("response_metadata"):
-                        _step = cl.Step(type="llm", name="Response Metadata")
-                        with _step:
-                            _step.output = response_metadata
-                            await _step.send()
-                    
-                    if tool_calls := chunk.get("tool_calls"):
-                        for tool_call in tool_calls:
-                            # exclude mcp tool calls
-                            if tool_call["name"].startswith("mcp."):
-                                continue
-                            tool_call_step = cl.Step(name=f"Tool: {tool_call["name"]}", type="tool", language="json", show_input=True)
-                            with tool_call_step:
-                                tool_call_step.input = tool_call["args"]
-                                await tool_call_step.stream_token("")
-                            tool_call_steps[tool_call["id"]] = tool_call_step
+            if interrupts:
+                resume_map = {}
+                
+                for interrupt in interrupts:
+                    interrupt_id = interrupt["id"]
+                    interrupt_value = interrupt["value"]
 
-                    if tool_call_id := chunk.get("tool_call_id"):
-                        with tool_call_steps[tool_call_id]:
-                            tool_call_steps[tool_call_id].is_error = (chunk["status"] != "success")
-                            tool_call_steps[tool_call_id].output = chunk["content"]
-                            await tool_call_steps[tool_call_id].send()
-                else:
-                    break
+                    if interrupt_value["type"] == "text":
+                        res = await cl.AskUserMessage(content=interrupt_value["text"]).send()
+                        resume_map[interrupt_id] = res["output"]
+                        
+                    elif interrupt_value["type"] == "tool_calls":
+                        tool_results = []
+                        for tool_call in interrupt_value["tool_calls"]:
+                            tool_result = None
 
-            if sse.event == "interrupts":
-                # TODO: Make this parallel
-                tool_results = [await call_mcp_tool(tool_call) for tool_call in sse.json()]
+                            with cl.Step(name=f"Tool: {tool_call["name"]}", type="tool") as step:
+                                step.input = tool_call["args"]
+                                if "create" in tool_call["name"] or "write" in tool_call["name"]:
+                                    step.default_open = True
+                                    await step.update()
+                                    
+                                    res = await cl.AskActionMessage(
+                                        content="Tool call", 
+                                        actions=[
+                                            cl.Action(name="Accept", payload={"value": "accept"}, label="✅ Accept"),
+                                            cl.Action(name="Cancel", payload={"value": "cancel"}, label="❌ Cancel")
+                                        ]
+                                    ).send()
+                                    if res.get("payload").get("value") == "cancel":
+                                        step.is_error = True
+                                        tool_result = "Tool calling was canceled by the user."
+
+                            if not tool_result:
+                                tool_result = await call_mcp_tool(tool_call)
+
+                            step.output = tool_result
+                            tool_results.append(tool_result)
+                            await step.update()
+
+                        resume_map[interrupt_id] = tool_results
+
                 stream = async_run_stream_messages(
+                    graph_name=agents[cl.context.session.chat_profile]["graph_name"],
                     thread_id=message.id,
                     input={},
-                    resume=tool_results,
-                    additional_options=additional_options
+                    additional_options=additional_options,
+                    resume=resume_map
                 )
-
-            elif sse.event == "error":
-                # TODO: handle error
-                raise sse.json()
-            
             else:
                 break
     

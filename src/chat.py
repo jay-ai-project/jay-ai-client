@@ -7,6 +7,7 @@ import config
 
 
 async def async_run_stream_messages(
+    graph_name: str,
     thread_id: str, 
     input: dict,
     resume: Any | None = None,
@@ -14,6 +15,7 @@ async def async_run_stream_messages(
 ) -> AsyncIterator[ServerSentEvent]:
     url = f"http://localhost:8123/api/chat/stream"
     payload = {
+        "graph_name": graph_name,
         "input": input,
         "resume": resume,
         "config": {
